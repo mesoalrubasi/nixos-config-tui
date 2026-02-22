@@ -16,7 +16,7 @@ For a detailed explanation and showcase, see the [blog post](https://oddlama.org
 <table>
     <tr>
         <td>
-            <b>Dependency graph</b>
+            <b>Dependency graph (graphia, not in the TUI)</b>
             <img width="3264" height="1626" alt="image" src="https://github.com/user-attachments/assets/f0df5794-0794-49af-9975-247f9c56e5e2" />
         </td>
         <td>
