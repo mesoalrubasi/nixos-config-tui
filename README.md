@@ -1,16 +1,17 @@
 # nixos-config-tui
 
 **WARNING: This is an experimental proof-of-concept. The patched Nix evaluator
-may have subtle bugs — do NOT use this in production. All internal NixOS tests
-pass, but hidden invariants may be broken. (tho it does work, just no guarantees!)**
+may have subtle bugs, please do NOT use this in production without validating
+what it does. All internal NixOS tests pass, but hidden invariants may be
+broken. (tho it does work, just no guarantees!)**
 
 A TUI which allows you to browse values and dependencies of NixOS options that influenced a NixOS configuration.
 This can be used to diff two configurations at the configuration/option-level as opposed to diffing the resulting derivation.
 
-For a detailed explanation and showcase, see the [blog post](https://oddlama.org/blog/tracking-options-in-nixos/).
+For a detailed explanation and showcase, see the [blog post](https://oddlama.org/blog/tracking-options-in-nixos/) or the
+[NixOS Discourse post](https://discourse.nixos.org/t/diffing-nixos-configurations-at-the-config-level/75554).
 
 ## Screenshots
-
 
 <table>
     <tr>
