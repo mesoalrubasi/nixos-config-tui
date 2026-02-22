@@ -1,0 +1,1254 @@
+diff --git a/src/libexpr/eval.cc b/src/libexpr/eval.cc
+index d9d8a986a..43c82cbfa 100644
+--- a/src/libexpr/eval.cc
++++ b/src/libexpr/eval.cc
+@@ -364,6 +364,106 @@ EvalState::EvalState(
+ 
+ EvalState::~EvalState() {}
+ 
++// Debug flag for dependency tracking (used in eval-inline.hh too)
++bool debugTrackingEval = std::getenv("NIX_DEBUG_TRACKING") != nullptr;
++
++void EvalState::recordDependency(TrackingScopeId scopeId, const TrackingAttrPath & accessor, const TrackingAttrPath & accessed)
++{
++    if (debugTrackingEval) {
++        std::cerr << "[TRACK] recordDependency: scopeId=" << scopeId << " accessor=[";
++        for (size_t i = 0; i < accessor.size(); i++) {
++            if (i > 0) std::cerr << ".";
++            std::cerr << symbols[accessor[i]];
++        }
++        std::cerr << "] -> accessed=[";
++        for (size_t i = 0; i < accessed.size(); i++) {
++            if (i > 0) std::cerr << ".";
++            std::cerr << symbols[accessed[i]];
++        }
++        std::cerr << "] (stack depth=" << forceContextStack.size();
++        if (!forceContextStack.empty()) {
++            std::cerr << ", top=[";
++            auto & top = forceContextStack.back();
++            for (size_t i = 0; i < top.originPath.size(); i++) {
++                if (i > 0) std::cerr << ".";
++                std::cerr << symbols[top.originPath[i]];
++            }
++            std::cerr << "]";
++        }
++        std::cerr << ")\n";
++    }
++    if (accessor == accessed)
++        return;
++    if (auto * scope = findTrackingScope(scopeId)) {
++        // Skip exact duplicates of the last recorded dependency (common with
++        // intermediate + final recording in ExprSelect)
++        if (!scope->deps.empty()) {
++            auto & last = scope->deps.back();
++            if (last.accessor == accessor && last.accessed == accessed)
++                return;
++        }
++        scope->deps.push_back({accessor, accessed});
++    }
++}
++
++EvalState::TrackingScope * EvalState::findTrackingScope(TrackingScopeId scopeId)
++{
++    for (auto & scope : trackingScopes) {
++        if (scope.id == scopeId)
++            return &scope;
++    }
++    return nullptr;
++}
++
++void EvalState::tagThunkOrigin(Value * thunk, TrackingScopeId scopeId, const TrackingAttrPath & path)
++{
++    // Allocate a copy of the path on the heap (GC-managed)
++    auto * pathCopy = new (mem.allocBytes(sizeof(TrackingAttrPath))) TrackingAttrPath(path);
++
++    if (thunk->isThunk()) {
++        // Key on (env, expr) which survives Value copies
++        auto key = ThunkKey{thunk->thunk().env, thunk->thunk().expr};
++        thunkOrigins[key] = ThunkOrigin{scopeId, pathCopy};
++    } else if (thunk->type() == nThunk) {
++        // tApp or tPrimOpApp: key on Value* directly
++        valueOrigins[thunk] = ThunkOrigin{scopeId, pathCopy};
++    } else {
++        // Already forced (not a thunk) — can't tag
++        return;
++    }
++
++    if (debugTrackingEval) {
++        std::cerr << "[TRACK] tagThunkOrigin: stored origin for value@" << (void*)thunk
++                  << " (isThunk=" << thunk->isThunk() << ", isApp=" << thunk->isApp()
++                  << ") path=[";
++        for (size_t i = 0; i < path.size(); i++) {
++            if (i > 0) std::cerr << ".";
++            std::cerr << symbols[path[i]];
++        }
++        std::cerr << "]\n";
++    }
++}
++
++EvalState::ThunkOrigin * EvalState::getThunkOrigin(const Value * thunk)
++{
++    // Check thunkOrigins for tThunk values (keyed by env/expr)
++    if (thunk->isThunk()) {
++        auto key = ThunkKey{thunk->thunk().env, thunk->thunk().expr};
++        auto it = thunkOrigins.find(key);
++        if (it != thunkOrigins.end()) {
++            return &it->second;
++        }
++    }
++
++    // Check valueOrigins for tApp/tPrimOpApp values (keyed by Value*)
++    auto vit = valueOrigins.find(thunk);
++    if (vit != valueOrigins.end()) {
++        return &vit->second;
++    }
++
++    return nullptr;
++}
++
+ void EvalState::allowPathLegacy(const Path & path)
+ {
+     if (auto rootFS2 = rootFS.dynamic_pointer_cast<AllowListSourceAccessor>())
+@@ -1411,6 +1511,11 @@ void ExprSelect::eval(EvalState & state, Env & env, Value & v)
+                                          showAttrSelectionPath(state, env, getAttrPath()))
+                                    : nullptr;
+ 
++        // Track the accessed path for dependency tracking
++        EvalState::TrackingAttrPath accessedPath;
++        const Bindings * originalBindings = nullptr;
++        EvalState::TrackingScopeId trackedScopeId = 0;
++
+         for (auto & i : getAttrPath()) {
+             state.nrLookups++;
+             const Attr * j;
+@@ -1418,11 +1523,19 @@ void ExprSelect::eval(EvalState & state, Env & env, Value & v)
+             if (def) {
+                 state.forceValue(*vAttrs, pos);
+                 if (vAttrs->type() != nAttrs || !(j = vAttrs->attrs()->get(name))) {
++                    // Record dependency up to the point we could resolve before falling back to default
++                    if (trackedScopeId != 0 && !accessedPath.empty() && !state.forceContextStack.empty()) {
++                        auto & ctx = state.forceContextStack.back();
++                        if (ctx.scopeId == trackedScopeId) {
++                            state.recordDependency(trackedScopeId, ctx.originPath, accessedPath);
++                        }
++                    }
+                     def->eval(state, env, v);
+                     return;
+                 }
+             } else {
+                 state.forceAttrs(*vAttrs, pos, "while selecting an attribute");
++
+                 if (!(j = vAttrs->attrs()->get(name))) {
+                     StringSet allAttrNames;
+                     for (auto & attr : *vAttrs->attrs())
+@@ -1435,14 +1548,101 @@ void ExprSelect::eval(EvalState & state, Env & env, Value & v)
+                         .debugThrow();
+                 }
+             }
++
++            // Check if this attrset is tracked (either root or previously registered sub-attrset)
++            if (vAttrs->type() == nAttrs) {
++                auto trackIt = state.trackedBindings.find(vAttrs->attrs());
++                if (trackIt != state.trackedBindings.end()) {
++                    if (accessedPath.empty()) {
++                        // First tracked attrset in the chain — start tracking
++                        originalBindings = vAttrs->attrs();
++                        trackedScopeId = trackIt->second.scopeId;
++                        accessedPath = trackIt->second.prefix;
++                        // If starting from a non-empty prefix (a registered sub-attrset),
++                        // record a dep for the prefix itself. This ensures e.g.
++                        // accessing options.X.isDefined also records X as a target,
++                        // not just X.isDefined.
++                        if (!accessedPath.empty() && !state.forceContextStack.empty()) {
++                            auto & ctx = state.forceContextStack.back();
++                            if (ctx.scopeId == trackedScopeId) {
++                                state.recordDependency(trackedScopeId, ctx.originPath, accessedPath);
++                            }
++                        }
++                    }
++                    // else: already tracking and this sub-attrset is already registered — good
++                } else if (trackedScopeId != 0 && !accessedPath.empty()) {
++                    // Intermediate attrset not yet registered — register it and tag members.
++                    state.trackedBindings[vAttrs->attrs()] = {trackedScopeId, accessedPath};
++                    for (auto & attr : *vAttrs->attrs()) {
++                        // Tag any lazy value (tThunk, tApp, tPrimOpApp)
++                        // Don't overwrite existing explicit tags (e.g., from
++                        // tagOptionValue in NixOS modules).
++                        if (attr.value->type(true) == nThunk && !state.getThunkOrigin(attr.value)) {
++                            EvalState::TrackingAttrPath memberPath = accessedPath;
++                            memberPath.push_back(attr.name);
++                            state.tagThunkOrigin(attr.value, trackedScopeId, memberPath);
++                        }
++                    }
++                }
++            }
++
++            // Build accessed path and record intermediate dependencies.
++            // Without intermediate recording, sub-attrset accessor nodes
++            // (e.g., boot.kernelPackages.kernel.features) become disconnected
++            // because only the final path is recorded as a dependency target.
++            if (trackedScopeId != 0) {
++                accessedPath.push_back(name);
++
++                if (!state.forceContextStack.empty()) {
++                    auto & ctx = state.forceContextStack.back();
++                    if (ctx.scopeId == trackedScopeId) {
++                        state.recordDependency(trackedScopeId, ctx.originPath, accessedPath);
++                    }
++                }
++            }
++
+             vAttrs = j->value;
+             pos2 = j->pos;
+             if (state.countCalls)
+                 state.attrSelects[pos2]++;
+         }
+ 
++        // Record dependency if we're accessing a tracked attrset and we're in a force context
++        if (trackedScopeId != 0 && !state.forceContextStack.empty()) {
++            auto & ctx = state.forceContextStack.back();
++            // Only record if same scope (avoid cross-scope pollution)
++            if (ctx.scopeId == trackedScopeId) {
++                state.recordDependency(trackedScopeId, ctx.originPath, accessedPath);
++            }
++        }
++
+         state.forceValue(*vAttrs, (pos2 ? pos2 : this->pos));
+ 
++        // Register sub-attrsets for recursive tracking.
++        // If the result of selecting through a tracked attrset is itself an attrset,
++        // register it so that later accesses (e.g., "let cfg = config.x; in cfg.y")
++        // are tracked with the correct prefix.
++        // Also tag member thunks so they push the correct accessor context when
++        // forced — this handles freeform values (e.g., system.build.toplevel)
++        // that aren't tagged by the module system's tagOptionsRecursive.
++        if (trackedScopeId != 0 && vAttrs->type() == nAttrs) {
++            auto subIt = state.trackedBindings.find(vAttrs->attrs());
++            if (subIt == state.trackedBindings.end()) {
++                state.trackedBindings[vAttrs->attrs()] = {trackedScopeId, accessedPath};
++
++                // Tag any lazy member values for accessor tracking.
++                // Don't overwrite existing explicit tags (e.g., from
++                // tagOptionValue in NixOS modules).
++                for (auto & attr : *vAttrs->attrs()) {
++                    if (attr.value->type(true) == nThunk && !state.getThunkOrigin(attr.value)) {
++                        EvalState::TrackingAttrPath memberPath = accessedPath;
++                        memberPath.push_back(attr.name);
++                        state.tagThunkOrigin(attr.value, trackedScopeId, memberPath);
++                    }
++                }
++            }
++        }
++
+     } catch (Error & e) {
+         if (pos2) {
+             auto pos2r = state.positions[pos2];
+@@ -1556,6 +1756,18 @@ void EvalState::callFunction(Value & fun, std::span<Value *> args, Value & vRes,
+                    there is no matching actual argument but the formal
+                    argument has a default, use the default. */
+                 size_t attrsUsed = 0;
++
++                // Check if the argument attrset is tracked for dependency recording.
++                // This handles pattern match destructuring like { group, permissions, ... }:
++                // which bypasses ExprSelect and would otherwise miss tracking.
++                TrackedBindingInfo * formalTrackInfo = nullptr;
++                if (!forceContextStack.empty()) {
++                    auto trackIt = trackedBindings.find(args[0]->attrs());
++                    if (trackIt != trackedBindings.end()) {
++                        formalTrackInfo = &trackIt->second;
++                    }
++                }
++
+                 for (auto & i : formals->formals) {
+                     auto j = args[0]->attrs()->get(i.name);
+                     if (!j) {
+@@ -1572,6 +1784,17 @@ void EvalState::callFunction(Value & fun, std::span<Value *> args, Value & vRes,
+                         env2.values[displ++] = i.def->maybeThunk(*this, env2);
+                     } else {
+                         attrsUsed++;
++
++                        // Record dependency for tracked attrset destructuring
++                        if (formalTrackInfo) {
++                            auto & ctx = forceContextStack.back();
++                            if (ctx.scopeId == formalTrackInfo->scopeId) {
++                                TrackingAttrPath accessedPath = formalTrackInfo->prefix;
++                                accessedPath.push_back(i.name);
++                                recordDependency(formalTrackInfo->scopeId, ctx.originPath, accessedPath);
++                            }
++                        }
++
+                         env2.values[displ++] = j->value;
+                     }
+                 }
+diff --git a/src/libexpr/include/nix/expr/eval-inline.hh b/src/libexpr/include/nix/expr/eval-inline.hh
+index 561c07f08..cf74ff3b2 100644
+--- a/src/libexpr/include/nix/expr/eval-inline.hh
++++ b/src/libexpr/include/nix/expr/eval-inline.hh
+@@ -85,24 +85,72 @@ Env & EvalMemory::allocEnv(size_t size)
+ [[gnu::always_inline]]
+ void EvalState::forceValue(Value & v, const PosIdx pos)
+ {
+-    if (v.isThunk()) {
+-        Env * env = v.thunk().env;
+-        assert(env || v.isBlackhole());
+-        Expr * expr = v.thunk().expr;
+-        try {
+-            v.mkBlackhole();
+-            // checkInterrupt();
+-            if (env) [[likely]]
+-                expr->eval(*this, *env, v);
+-            else
+-                ExprBlackHole::throwInfiniteRecursionError(*this, v);
+-        } catch (...) {
+-            v.mkThunk(env, expr);
+-            tryFixupBlackHolePos(v, pos);
+-            throw;
++    // Loop to fully force the value (handles nested thunks from tagThunkOrigin)
++    while (v.isThunk() || v.isApp()) {
++        // Check if this lazy value has an embedded origin for tracking.
++        auto * origin = getThunkOrigin(&v);
++        bool pushedTrackingCtx = false;
++        TrackingScopeId originScopeId = 0;
++        TrackingAttrPath originPath;
++        if (origin && origin->path) {
++            ForceContext ctx;
++            ctx.scopeId = origin->scopeId;
++            ctx.originPath = *origin->path;
++            originScopeId = origin->scopeId;
++            originPath = *origin->path;
++            forceContextStack.push_back(std::move(ctx));
++            pushedTrackingCtx = true;
+         }
+-    } else if (v.isApp())
+-        callFunction(*v.app().left, *v.app().right, v, pos);
++
++        if (v.isThunk()) {
++            Env * env = v.thunk().env;
++            assert(env || v.isBlackhole());
++            Expr * expr = v.thunk().expr;
++            try {
++                v.mkBlackhole();
++                if (env) [[likely]]
++                    expr->eval(*this, *env, v);
++                else
++                    ExprBlackHole::throwInfiniteRecursionError(*this, v);
++            } catch (...) {
++                v.mkThunk(env, expr);
++                tryFixupBlackHolePos(v, pos);
++                if (pushedTrackingCtx) {
++                    forceContextStack.pop_back();
++                }
++                throw;
++            }
++        } else {
++            // v.isApp()
++            callFunction(*v.app().left, *v.app().right, v, pos);
++        }
++
++        if (pushedTrackingCtx) {
++            forceContextStack.pop_back();
++
++            // If the forced value is an attrset, register it as a tracked
++            // sub-attrset so downstream accesses (e.g., from lambda arguments
++            // after mapAttrsToList iteration) are tracked.
++            if (v.type() == nAttrs && originScopeId != 0) {
++                auto subIt = trackedBindings.find(v.attrs());
++                if (subIt == trackedBindings.end()) {
++                    trackedBindings[v.attrs()] = {originScopeId, originPath};
++                    for (auto & attr : *v.attrs()) {
++                        if (attr.value->type(true) == nThunk) {
++                            // Don't overwrite existing explicit tags (e.g., from
++                            // tagOptionValue in NixOS modules which tags option
++                            // .value thunks with the option path directly).
++                            if (!getThunkOrigin(attr.value)) {
++                                TrackingAttrPath memberPath = originPath;
++                                memberPath.push_back(attr.name);
++                                tagThunkOrigin(attr.value, originScopeId, memberPath);
++                            }
++                        }
++                    }
++                }
++            }
++        }
++    }
+ }
+ 
+ [[gnu::always_inline]]
+diff --git a/src/libexpr/include/nix/expr/eval.hh b/src/libexpr/include/nix/expr/eval.hh
+index 29acb4547..b8c4c2d7c 100644
+--- a/src/libexpr/include/nix/expr/eval.hh
++++ b/src/libexpr/include/nix/expr/eval.hh
+@@ -1065,6 +1065,113 @@ private:
+     typedef boost::unordered_flat_map<PosIdx, size_t, std::hash<PosIdx>> AttrSelects;
+     AttrSelects attrSelects;
+ 
++public:
++    /**
++     * Fixpoint dependency tracking types and state.
++     */
++
++    /** Tracking scope ID (0 = not tracked) */
++    using TrackingScopeId = uint64_t;
++
++    /** Attribute path representation for tracking */
++    using TrackingAttrPath = std::vector<Symbol, traceable_allocator<Symbol>>;
++
++    /** A recorded dependency: "accessor" depends on "accessed" */
++    struct DependencyRecord {
++        TrackingAttrPath accessor;
++        TrackingAttrPath accessed;
++    };
++
++    /** Per-scope tracking data */
++    struct TrackingScope {
++        TrackingScopeId id;
++        const Bindings * trackedBindings;
++        std::vector<DependencyRecord, traceable_allocator<DependencyRecord>> deps;
++    };
++
++    /** Force context: who is being evaluated (the accessor) */
++    struct ForceContext {
++        TrackingScopeId scopeId;
++        TrackingAttrPath originPath;
++    };
++
++    /** Thunk origin: embedded in thunks to identify their origin path.
++        When a thunk with an origin is forced, it pushes its origin as the accessor context. */
++    struct ThunkOrigin {
++        TrackingScopeId scopeId;
++        TrackingAttrPath * path;  // heap-allocated, managed by GC
++    };
++
++    /** Next tracking scope ID to allocate */
++    uint64_t nextTrackingScopeId = 1;
++
++    /** All tracking scopes */
++    std::vector<TrackingScope, traceable_allocator<TrackingScope>> trackingScopes;
++
++    /** Info stored for each tracked attrset binding */
++    struct TrackedBindingInfo {
++        TrackingScopeId scopeId;
++        TrackingAttrPath prefix;  // path prefix for sub-attrsets (e.g., ["services", "nginx"])
++    };
++
++    /** Which bindings are tracked (attrset pointer → scope ID + prefix) */
++    boost::unordered_flat_map<
++        const Bindings *,
++        TrackedBindingInfo,
++        std::hash<const Bindings *>,
++        std::equal_to<const Bindings *>,
++        traceable_allocator<std::pair<const Bindings * const, TrackedBindingInfo>>> trackedBindings;
++
++    /** Thunk origin tracking - maps (Env*, Expr*) pairs to their origin path.
++        We key on the thunk's internal (env, expr) pair rather than Value* because
++        Values get copied around during evaluation, but the (env, expr) contents
++        are stable identifiers for the thunk.
++        This is the key to thunk-embedded origins: when a thunk is forced,
++        we check this map and push the origin as accessor context. */
++    using ThunkKey = std::pair<const Env *, const Expr *>;
++    struct ThunkKeyHash {
++        std::size_t operator()(const ThunkKey & k) const {
++            return std::hash<const void *>()(k.first) ^ (std::hash<const void *>()(k.second) << 1);
++        }
++    };
++    boost::unordered_flat_map<
++        ThunkKey,
++        ThunkOrigin,
++        ThunkKeyHash,
++        std::equal_to<ThunkKey>,
++        traceable_allocator<std::pair<const ThunkKey, ThunkOrigin>>> thunkOrigins;
++
++    /** Value-pointer origin tracking - for tApp and tPrimOpApp values that
++        don't have (Env*, Expr*) keys. We key on Value* directly since these
++        are stable pointers in Bindings until forced. */
++    boost::unordered_flat_map<
++        const Value *,
++        ThunkOrigin,
++        std::hash<const Value *>,
++        std::equal_to<const Value *>,
++        traceable_allocator<std::pair<const Value * const, ThunkOrigin>>> valueOrigins;
++
++    /** Current force context stack (who is being evaluated).
++        When a thunk with registered origin is forced, it pushes its origin here.
++        When attribute access occurs on a tracked attrset, we record
++        {accessor from stack, accessed path} as a dependency. */
++    std::vector<ForceContext, traceable_allocator<ForceContext>> forceContextStack;
++
++
++    /** Record a dependency in the given scope */
++    void recordDependency(TrackingScopeId scopeId, const TrackingAttrPath & accessor, const TrackingAttrPath & accessed);
++
++    /** Find tracking scope by ID */
++    TrackingScope * findTrackingScope(TrackingScopeId scopeId);
++
++    /** Tag a thunk with its origin path for dependency tracking.
++        When this thunk is later forced, it will push its origin as accessor context. */
++    void tagThunkOrigin(Value * thunk, TrackingScopeId scopeId, const TrackingAttrPath & path);
++
++    /** Get the origin of a thunk, if it has one */
++    ThunkOrigin * getThunkOrigin(const Value * thunk);
++
++private:
+     friend struct ExprOpUpdate;
+     friend struct ExprOpConcatLists;
+     friend struct ExprVar;
+@@ -1076,6 +1183,11 @@ private:
+     friend void prim_getAttr(EvalState & state, const PosIdx pos, Value ** args, Value & v);
+     friend void prim_match(EvalState & state, const PosIdx pos, Value ** args, Value & v);
+     friend void prim_split(EvalState & state, const PosIdx pos, Value ** args, Value & v);
++    friend void prim_trackAttrset(EvalState & state, const PosIdx pos, Value ** args, Value & v);
++    friend void prim_createTrackingScope(EvalState & state, const PosIdx pos, Value ** args, Value & v);
++    friend void prim_registerTrackedAttrset(EvalState & state, const PosIdx pos, Value ** args, Value & v);
++    friend void prim_tagThunkOrigin(EvalState & state, const PosIdx pos, Value ** args, Value & v);
++    friend void prim_getDependencies(EvalState & state, const PosIdx pos, Value ** args, Value & v);
+ 
+     friend struct Value;
+     friend class ListBuilder;
+diff --git a/src/libexpr/primops.cc b/src/libexpr/primops.cc
+index b31168566..32f5e5507 100644
+--- a/src/libexpr/primops.cc
++++ b/src/libexpr/primops.cc
+@@ -1208,6 +1208,49 @@ static RegisterPrimOp primop_tryEval({
+     .fun = prim_tryEval,
+ });
+ 
++/* Like tryEval but catches ALL evaluation errors, not just throw/assert.
++ * Also deeply evaluates the argument so that errors in nested structures
++ * (string interpolations, list elements, attrset values) are caught. */
++static void prim_tryCatchAll(EvalState & state, const PosIdx pos, Value ** args, Value & v)
++{
++    auto attrs = state.buildBindings(2);
++
++    MaintainCount trylevel(state.trylevel);
++
++    ReplExitStatus (*savedDebugRepl)(ref<EvalState> es, const ValMap & extraEnv) = nullptr;
++    if (state.debugRepl && state.settings.ignoreExceptionsDuringTry) {
++        savedDebugRepl = state.debugRepl;
++        state.debugRepl = nullptr;
++    }
++
++    try {
++        state.forceValueDeep(*args[0]);
++        attrs.insert(state.s.value, args[0]);
++        attrs.insert(state.symbols.create("success"), &Value::vTrue);
++    } catch (EvalBaseError & e) {
++        attrs.insert(state.s.value, &Value::vFalse);
++        attrs.insert(state.symbols.create("success"), &Value::vFalse);
++    }
++
++    if (savedDebugRepl)
++        state.debugRepl = savedDebugRepl;
++
++    v.mkAttrs(attrs);
++}
++
++static RegisterPrimOp primop_tryCatchAll({
++    .name = "__tryCatchAll",
++    .args = {"e"},
++    .doc = R"(
++      Like `tryEval` but catches **all** evaluation errors (including
++      missing attributes, type errors, `abort`, etc.) and deeply
++      evaluates *e* before returning. Returns `{ success = true;
++      value = e; }` on success, `{ success = false; value = false; }`
++      on any error.
++    )",
++    .fun = prim_tryCatchAll,
++});
++
+ /* Return an environment variable.  Use with care. */
+ static void prim_getEnv(EvalState & state, const PosIdx pos, Value ** args, Value & v)
+ {
+@@ -3083,7 +3126,22 @@ void prim_getAttr(EvalState & state, const PosIdx pos, Value ** args, Value & v)
+ {
+     auto attr = state.forceStringNoCtx(*args[0], pos, "while evaluating the first argument passed to builtins.getAttr");
+     state.forceAttrs(*args[1], pos, "while evaluating the second argument passed to builtins.getAttr");
+-    auto i = state.getAttr(state.symbols.create(attr), args[1]->attrs(), "in the attribute set under consideration");
++    auto name = state.symbols.create(attr);
++    auto i = state.getAttr(name, args[1]->attrs(), "in the attribute set under consideration");
++
++    // Track dependency if accessing a tracked attrset and in force context
++    if (!state.forceContextStack.empty()) {
++        auto trackIt = state.trackedBindings.find(args[1]->attrs());
++        if (trackIt != state.trackedBindings.end()) {
++            auto & ctx = state.forceContextStack.back();
++            if (ctx.scopeId == trackIt->second.scopeId) {
++                EvalState::TrackingAttrPath accessedPath = trackIt->second.prefix;
++                accessedPath.push_back(name);
++                state.recordDependency(trackIt->second.scopeId, ctx.originPath, accessedPath);
++            }
++        }
++    }
++
+     // !!! add to stack trace?
+     if (state.countCalls && i->pos)
+         state.attrSelects[i->pos]++;
+@@ -5123,6 +5181,546 @@ static RegisterPrimOp primop_splitVersion({
+     .fun = prim_splitVersion,
+ });
+ 
++/*************************************************************
++ * Dependency Tracking
++ *************************************************************/
++
++/* Helper to build dependency list for output */
++static void buildDependencyList(EvalState & state, EvalState::TrackingScopeId scopeId, Value & v)
++{
++    static bool debugTracking = std::getenv("NIX_DEBUG_TRACKING") != nullptr;
++    if (debugTracking) {
++        std::cerr << "[TRACK] buildDependencyList: looking for scopeId=" << scopeId
++                  << ", trackingScopes.size()=" << state.trackingScopes.size() << "\n";
++        for (auto & scope : state.trackingScopes) {
++            std::cerr << "[TRACK]   scope id=" << scope.id << ", deps.size()=" << scope.deps.size() << "\n";
++        }
++    }
++
++    auto * scope = state.findTrackingScope(scopeId);
++    if (!scope) {
++        if (debugTracking) {
++            std::cerr << "[TRACK] buildDependencyList: scope not found!\n";
++        }
++        v.mkList(state.buildList(0));
++        return;
++    }
++
++    if (debugTracking) {
++        std::cerr << "[TRACK] buildDependencyList: found scope with " << scope->deps.size() << " deps\n";
++    }
++
++    auto list = state.buildList(scope->deps.size());
++    size_t idx = 0;
++    for (auto & dep : scope->deps) {
++        // Each dependency is an attrset { accessor = [...]; accessed = [...]; }
++        auto bindings = state.buildBindings(2);
++
++        // Build accessor path list
++        auto accessorList = state.buildList(dep.accessor.size());
++        for (size_t i = 0; i < dep.accessor.size(); i++) {
++            Value * pathElem = state.allocValue();
++            pathElem->mkString(state.symbols[dep.accessor[i]], state.mem);
++            accessorList[i] = pathElem;
++        }
++        Value * vAccessor = state.allocValue();
++        vAccessor->mkList(accessorList);
++        bindings.insert(state.symbols.create("accessor"), vAccessor);
++
++        // Build accessed path list
++        auto accessedList = state.buildList(dep.accessed.size());
++        for (size_t i = 0; i < dep.accessed.size(); i++) {
++            Value * pathElem = state.allocValue();
++            pathElem->mkString(state.symbols[dep.accessed[i]], state.mem);
++            accessedList[i] = pathElem;
++        }
++        Value * vAccessed = state.allocValue();
++        vAccessed->mkList(accessedList);
++        bindings.insert(state.symbols.create("accessed"), vAccessed);
++
++        Value * vDep = state.allocValue();
++        vDep->mkAttrs(bindings);
++        list[idx++] = vDep;
++    }
++
++    v.mkList(list);
++}
++
++/* Register an attrset for tracking and return its scope ID.
++   This is the first step in the thunk-embedded origins approach:
++   mark an attrset (like `config`) so that accesses to it are tracked. */
++// Debug flag for dependency tracking
++static bool debugTracking = std::getenv("NIX_DEBUG_TRACKING") != nullptr;
++
++void prim_trackAttrset(EvalState & state, const PosIdx pos, Value ** args, Value & v)
++{
++    state.forceAttrs(*args[0], pos, "while evaluating the argument passed to builtins.trackAttrset");
++
++    // Check if already tracked
++    auto it = state.trackedBindings.find(args[0]->attrs());
++    if (it != state.trackedBindings.end()) {
++        // Already tracked, return existing scope ID
++        if (debugTracking) {
++            std::cerr << "[TRACK] trackAttrset: already tracked, returning scopeId=" << it->second.scopeId
++                      << " (Bindings*=" << (void*)args[0]->attrs() << ")\n";
++        }
++        v.mkInt(it->second.scopeId);
++        return;
++    }
++
++    // Create new tracking scope
++    EvalState::TrackingScopeId scopeId = state.nextTrackingScopeId++;
++    EvalState::TrackingScope scope;
++    scope.id = scopeId;
++    scope.trackedBindings = args[0]->attrs();
++    state.trackingScopes.push_back(std::move(scope));
++    state.trackedBindings[args[0]->attrs()] = {scopeId, {}};
++
++    if (debugTracking) {
++        std::cerr << "[TRACK] trackAttrset: NEW scopeId=" << scopeId
++                  << " (Bindings*=" << (void*)args[0]->attrs() << ")\n";
++    }
++
++    v.mkInt(scopeId);
++}
++
++static RegisterPrimOp primop_trackAttrset({
++    .name = "__trackAttrset",
++    .args = {"attrset"},
++    .doc = R"(
++      Register an attribute set for dependency tracking and return its scope ID.
++
++      This is the foundation of the thunk-embedded origins approach to dependency
++      tracking. After registering an attrset (like `config` in the NixOS module
++      system), any attribute accesses on it will be recorded when they occur
++      during evaluation of thunks that have been tagged with `tagThunkOrigin`.
++
++      Returns an integer scope ID that should be passed to `tagThunkOrigin` and
++      `getDependencies`.
++
++      Example:
++      ```nix
++      let
++        config = { a = 1; b = config.a + 1; };
++        scopeId = builtins.trackAttrset config;
++        # Now tag thunks and evaluate to capture dependencies
++      in ...
++      ```
++    )",
++    .fun = prim_trackAttrset,
++});
++
++/* Create a tracking scope without associating it with an attrset yet.
++   This allows creating the scope ID before the attrset (e.g., config) exists,
++   breaking circular dependencies in the module system. */
++void prim_createTrackingScope(EvalState & state, const PosIdx pos, Value ** args, Value & v)
++{
++    // Create new tracking scope without any associated attrset
++    EvalState::TrackingScopeId scopeId = state.nextTrackingScopeId++;
++    EvalState::TrackingScope scope;
++    scope.id = scopeId;
++    scope.trackedBindings = nullptr;  // Will be set later by registerTrackedAttrset
++    state.trackingScopes.push_back(std::move(scope));
++
++    if (debugTracking) {
++        std::cerr << "[TRACK] createTrackingScope: NEW scopeId=" << scopeId << " (no attrset yet)\n";
++    }
++
++    v.mkInt(scopeId);
++}
++
++static RegisterPrimOp primop_createTrackingScope({
++    .name = "__createTrackingScope",
++    .args = {},
++    .doc = R"(
++      Create a new dependency tracking scope and return its scope ID.
++
++      Unlike `trackAttrset`, this does not require an attrset upfront. Use this
++      when you need the scope ID before the attrset exists (e.g., in the NixOS
++      module system where `config` depends on option values that need to be
++      tagged with the scope ID).
++
++      After creating the scope, use `registerTrackedAttrset` to associate an
++      attrset with it, and `tagThunkOrigin` to tag thunks.
++
++      Example:
++      ```nix
++      let
++        scopeId = builtins.createTrackingScope;
++        # Use scopeId to tag thunks...
++        config = { ... };  # config can now reference tagged values
++        _ = builtins.registerTrackedAttrset scopeId config;
++      in ...
++      ```
++    )",
++    .fun = prim_createTrackingScope,
++});
++
++/* Register an attrset with an existing tracking scope.
++   This completes the two-phase tracking setup started by createTrackingScope. */
++void prim_registerTrackedAttrset(EvalState & state, const PosIdx pos, Value ** args, Value & v)
++{
++    auto scopeId = state.forceInt(*args[0], pos, "while evaluating the first argument (scopeId) passed to builtins.registerTrackedAttrset");
++    state.forceAttrs(*args[1], pos, "while evaluating the second argument (attrset) passed to builtins.registerTrackedAttrset");
++
++    auto scopeIdVal = static_cast<EvalState::TrackingScopeId>(scopeId.value);
++
++    // Find the scope
++    auto * scope = state.findTrackingScope(scopeIdVal);
++    if (!scope) {
++        state.error<EvalError>("invalid tracking scope ID %1%", scopeIdVal).atPos(pos).debugThrow();
++    }
++
++    // Check if this attrset is already registered with a different scope
++    auto it = state.trackedBindings.find(args[1]->attrs());
++    if (it != state.trackedBindings.end() && it->second.scopeId != scopeIdVal) {
++        // Already tracked by different scope - this is fine, just warn in debug
++        if (debugTracking) {
++            std::cerr << "[TRACK] registerTrackedAttrset: attrset already tracked by scopeId=" << it->second.scopeId
++                      << ", ignoring registration for scopeId=" << scopeIdVal << "\n";
++        }
++    } else {
++        // Register the attrset with this scope (no prefix for root)
++        scope->trackedBindings = args[1]->attrs();
++        state.trackedBindings[args[1]->attrs()] = {scopeIdVal, {}};
++
++        if (debugTracking) {
++            std::cerr << "[TRACK] registerTrackedAttrset: scopeId=" << scopeIdVal
++                      << " -> Bindings*=" << (void*)args[1]->attrs() << "\n";
++        }
++    }
++
++    // Return the scope ID for convenience
++    v.mkInt(scopeIdVal);
++}
++
++static RegisterPrimOp primop_registerTrackedAttrset({
++    .name = "__registerTrackedAttrset",
++    .args = {"scopeId", "attrset"},
++    .doc = R"(
++      Register an attribute set with an existing tracking scope.
++
++      This is the second step in the two-phase tracking setup. First create a
++      scope with `createTrackingScope`, then use this function to associate
++      an attrset with it.
++
++      Arguments:
++      - scopeId: The scope ID returned by `createTrackingScope`
++      - attrset: The attribute set to track (e.g., `config`)
++
++      Returns the scope ID.
++
++      Example:
++      ```nix
++      let
++        scopeId = builtins.createTrackingScope;
++        config = evalModulesInternal scopeId modules;
++        _ = builtins.registerTrackedAttrset scopeId config;
++      in config
++      ```
++    )",
++    .fun = prim_registerTrackedAttrset,
++});
++
++/* Tag a thunk with its origin path for dependency tracking.
++   When this thunk is later forced, it will push its origin as the accessor context,
++   so any attribute accesses during evaluation are attributed to this origin. */
++void prim_tagThunkOrigin(EvalState & state, const PosIdx pos, Value ** args, Value & v)
++{
++    // arg 0: scope ID (integer)
++    // arg 1: origin path (list of strings)
++    // arg 2: thunk value to tag
++
++    auto scopeId = state.forceInt(*args[0], pos, "while evaluating the first argument (scopeId) passed to builtins.tagThunkOrigin");
++
++    state.forceList(*args[1], pos, "while evaluating the second argument (path) passed to builtins.tagThunkOrigin");
++
++    // Parse origin path
++    EvalState::TrackingAttrPath path;
++    for (auto elem : args[1]->listView()) {
++        state.forceStringNoCtx(*elem, pos, "while evaluating a path element in builtins.tagThunkOrigin");
++        path.push_back(state.symbols.create(elem->string_view()));
++    }
++
++    // Don't force args[2] - we want to keep it as a thunk!
++    Value * thunk = args[2];
++
++    // Copy the value to the output first
++    v = *thunk;
++
++    // Tag the value if it's any kind of lazy value (tThunk, tApp, tPrimOpApp)
++    state.tagThunkOrigin(&v, scopeId.value, path);
++}
++
++static RegisterPrimOp primop_tagThunkOrigin({
++    .name = "__tagThunkOrigin",
++    .args = {"scopeId", "path", "thunk"},
++    .doc = R"(
++      Tag a thunk value with its origin path for dependency tracking.
++
++      When the tagged thunk is later forced (evaluated), it will automatically
++      push its origin path as the "accessor" context. Any attribute accesses
++      on tracked attrsets during that evaluation will be recorded as dependencies
++      of this origin.
++
++      This is the key to thunk-embedded origins: the accessor is determined at
++      thunk creation time (when this function is called), not at force time.
++      This solves the evaluation order problem where the same thunk might be
++      forced by different accessors.
++
++      Arguments:
++      - scopeId: The tracking scope ID returned by `trackAttrset`
++      - path: A list of strings representing the origin path (e.g., ["services" "nginx" "enable"])
++      - thunk: The thunk value to tag (MUST be unevaluated)
++
++      Returns the thunk unchanged (does not force it).
++
++      Example:
++      ```nix
++      let
++        config = { ... };
++        scopeId = builtins.trackAttrset config;
++        taggedValue = builtins.tagThunkOrigin scopeId ["myOption"] config.myOption;
++        # When taggedValue is forced, any accesses to config.* will be recorded
++        # with accessor = ["myOption"]
++      in taggedValue
++      ```
++    )",
++    .fun = prim_tagThunkOrigin,
++});
++
++/* Tag a specific attribute's thunk in-place within an attrset.
++   Unlike tagThunkOrigin which tags a value passed as argument (creating a wrapper
++   thunk problem when used inside { value = tagThunkOrigin ... }), this tags the
++   actual Value* stored in the attrset's Bindings, avoiding any wrapper. */
++void prim_tagAttrThunkOrigin(EvalState & state, const PosIdx pos, Value ** args, Value & v)
++{
++    // arg 0: scope ID (integer)
++    // arg 1: origin path (list of strings)
++    // arg 2: attribute name (string)
++    // arg 3: attrset containing the attribute
++
++    auto scopeId = state.forceInt(*args[0], pos, "while evaluating the first argument (scopeId) passed to builtins.tagAttrThunkOrigin");
++
++    state.forceList(*args[1], pos, "while evaluating the second argument (path) passed to builtins.tagAttrThunkOrigin");
++
++    // Parse origin path
++    EvalState::TrackingAttrPath path;
++    for (auto elem : args[1]->listView()) {
++        state.forceStringNoCtx(*elem, pos, "while evaluating a path element in builtins.tagAttrThunkOrigin");
++        path.push_back(state.symbols.create(elem->string_view()));
++    }
++
++    auto attrName = state.forceStringNoCtx(*args[2], pos, "while evaluating the third argument (attrName) passed to builtins.tagAttrThunkOrigin");
++    auto name = state.symbols.create(attrName);
++
++    // Force the attrset to get its Bindings
++    state.forceAttrs(*args[3], pos, "while evaluating the fourth argument (attrset) passed to builtins.tagAttrThunkOrigin");
++
++    // Find the attribute in the Bindings
++    auto * attr = args[3]->attrs()->get(name);
++    if (!attr) {
++        state.error<EvalError>("attribute '%1%' not found in attrset", state.symbols[name])
++            .atPos(pos)
++            .debugThrow();
++    }
++
++    // Tag the Value* directly in the Bindings — no wrapper thunk created
++    state.tagThunkOrigin(attr->value, scopeId.value, path);
++
++    // Return the attrset unchanged
++    v = *args[3];
++}
++
++static RegisterPrimOp primop_tagAttrThunkOrigin({
++    .name = "__tagAttrThunkOrigin",
++    .args = {"scopeId", "path", "attrName", "attrset"},
++    .doc = R"(
++      Tag a specific attribute's thunk directly within an attrset's Bindings.
++
++      Unlike `tagThunkOrigin`, which tags a value passed as an argument (and
++      thus creates a wrapper thunk when used inside `{ value = tagThunkOrigin ... }`),
++      this function tags the actual `Value*` stored in the attrset's internal
++      `Bindings` structure. This avoids the wrapper thunk problem where
++      auto-registration would tag the wrapper with an incorrect path.
++
++      Arguments:
++      - scopeId: The tracking scope ID
++      - path: Origin path (list of strings)
++      - attrName: The attribute name whose thunk to tag
++      - attrset: The attrset containing the attribute
++
++      Returns the attrset unchanged. The tagging is a side effect.
++    )",
++    .fun = prim_tagAttrThunkOrigin,
++});
++
++/* Get the recorded dependencies for a tracking scope. */
++void prim_getDependencies(EvalState & state, const PosIdx pos, Value ** args, Value & v)
++{
++    auto scopeId = state.forceInt(*args[0], pos, "while evaluating the argument passed to builtins.getDependencies");
++
++    buildDependencyList(state, scopeId.value, v);
++}
++
++static RegisterPrimOp primop_getDependencies({
++    .name = "__getDependencies",
++    .args = {"scopeId"},
++    .doc = R"(
++      Get all recorded dependencies for a tracking scope.
++
++      Returns a list of dependency records, where each record is an attrset with:
++      - `accessor`: list of strings representing the path that caused the access
++      - `accessed`: list of strings representing the path that was accessed
++
++      Example:
++      ```nix
++      let
++        config = { a = 1; b = config.a + 1; };
++        scopeId = builtins.trackAttrset config;
++        # Tag and force thunks to record dependencies
++        _ = builtins.seq (builtins.tagThunkOrigin scopeId ["b"] config.b) null;
++      in builtins.getDependencies scopeId
++      # Returns: [ { accessor = ["b"]; accessed = ["a"]; } ]
++      ```
++    )",
++    .fun = prim_getDependencies,
++});
++
++/* Tag and return an attribute from a tracked attrset.
++   This combines getAttr, tag, and return in one operation to preserve pointer identity.
++   When the returned value is forced, it will record dependencies correctly. */
++void prim_getAttrTagged(EvalState & state, const PosIdx pos, Value ** args, Value & v)
++{
++    // arg 0: scope ID (integer)
++    // arg 1: attribute path (list of strings)
++    // arg 2: attrset
++
++    auto scopeId = state.forceInt(*args[0], pos, "while evaluating the first argument (scopeId) passed to builtins.getAttrTagged");
++    state.forceList(*args[1], pos, "while evaluating the second argument (path) passed to builtins.getAttrTagged");
++    state.forceAttrs(*args[2], pos, "while evaluating the third argument (attrset) passed to builtins.getAttrTagged");
++
++    // Parse the attribute path
++    EvalState::TrackingAttrPath path;
++    for (auto elem : args[1]->listView()) {
++        state.forceStringNoCtx(*elem, pos, "while evaluating a path element in builtins.getAttrTagged");
++        path.push_back(state.symbols.create(elem->string_view()));
++    }
++
++    if (path.empty()) {
++        state.error<EvalError>("empty attribute path")
++            .atPos(pos)
++            .debugThrow();
++    }
++
++    // Debug: print path being tracked
++    if (debugTracking) {
++        std::cerr << "[TRACK] getAttrTagged: scopeId=" << scopeId.value << " path=[";
++        for (size_t i = 0; i < path.size(); i++) {
++            if (i > 0) std::cerr << ".";
++            std::cerr << state.symbols[path[i]];
++        }
++        std::cerr << "] attrset Bindings*=" << (void*)args[2]->attrs() << "\n";
++    }
++
++    // Navigate to the attribute
++    Value * current = args[2];
++    for (size_t i = 0; i < path.size(); i++) {
++        state.forceAttrs(*current, pos, "while navigating attribute path in builtins.getAttrTagged");
++        auto attr = current->attrs()->get(path[i]);
++        if (!attr) {
++            state.error<EvalError>("attribute '%s' missing", state.symbols[path[i]])
++                .atPos(pos)
++                .debugThrow();
++        }
++        current = attr->value;
++    }
++
++    // Tag the VALUE IN THE ATTRSET (current points to the actual stored value)
++    // This is crucial: we tag the ORIGINAL pointer, not a copy
++    if (current->isThunk() || current->isApp()) {
++        if (debugTracking) {
++            std::cerr << "[TRACK] getAttrTagged: tagging thunk/app at Value*=" << (void*)current << "\n";
++        }
++        state.tagThunkOrigin(current, scopeId.value, path);
++    } else {
++        if (debugTracking) {
++            std::cerr << "[TRACK] getAttrTagged: value already forced (type=" << current->type() << "), not a thunk\n";
++        }
++    }
++
++    // Push the force context manually
++    EvalState::ForceContext ctx;
++    ctx.scopeId = scopeId.value;
++    ctx.originPath = path;
++    state.forceContextStack.push_back(std::move(ctx));
++
++    if (debugTracking) {
++        std::cerr << "[TRACK] getAttrTagged: pushed forceContext for [";
++        for (size_t i = 0; i < path.size(); i++) {
++            if (i > 0) std::cerr << ".";
++            std::cerr << state.symbols[path[i]];
++        }
++        std::cerr << "], stack size=" << state.forceContextStack.size() << "\n";
++    }
++
++    try {
++        // Force the value - this will record any dependencies
++        state.forceValue(*current, pos);
++        if (debugTracking) {
++            std::cerr << "[TRACK] getAttrTagged: after forceValue, stack size=" << state.forceContextStack.size() << "\n";
++        }
++    } catch (...) {
++        state.forceContextStack.pop_back();
++        throw;
++    }
++
++    state.forceContextStack.pop_back();
++
++    // Return the forced value
++    v = *current;
++}
++
++static RegisterPrimOp primop_getAttrTagged({
++    .name = "__getAttrTagged",
++    .args = {"scopeId", "path", "attrset"},
++    .doc = R"(
++      Access and evaluate an attribute from a tracked attrset, recording dependencies.
++
++      This is the primary way to use thunk-embedded origins for dependency tracking.
++      It combines several steps:
++      1. Navigate to the attribute path
++      2. Push the path as the current accessor context
++      3. Force the value (recording any dependencies)
++      4. Pop the context and return the value
++
++      Arguments:
++      - scopeId: The tracking scope ID returned by `trackAttrset`
++      - path: A list of strings representing the attribute path to access
++      - attrset: The tracked attrset to access
++
++      Example:
++      ```nix
++      let
++        config = let self = { a = 1; b = self.a + 1; c = self.b + self.a; }; in self;
++        scopeId = builtins.trackAttrset config;
++        # Evaluate config.b with tracking
++        bValue = builtins.getAttrTagged scopeId ["b"] config;
++        # Evaluate config.c with tracking
++        cValue = builtins.getAttrTagged scopeId ["c"] config;
++      in {
++        b = bValue;  # 2
++        c = cValue;  # 3
++        deps = builtins.getDependencies scopeId;
++        # deps = [ { accessor = ["b"]; accessed = ["a"]; }
++        #          { accessor = ["c"]; accessed = ["b"]; }
++        #          { accessor = ["c"]; accessed = ["a"]; } ]
++      }
++      ```
++    )",
++    .fun = prim_getAttrTagged,
++});
++
+ /*************************************************************
+  * Primop registration
+  *************************************************************/
+diff --git a/test-nixos-toplevel-2.nix b/test-nixos-toplevel-2.nix
+new file mode 100644
+index 000000000..6d671629e
+--- /dev/null
++++ b/test-nixos-toplevel-2.nix
+@@ -0,0 +1,56 @@
++# Minimal NixOS evaluation with dependency tracking for system.build.toplevel
++#
++# This is a thin test harness that uses the integrated dependency tracking
++# from eval-config.nix. All processing logic lives in nixpkgs/nixos/lib/dependency-tracking.nix.
++#
++# Usage:
++#   nix build -f test-nixos-toplevel.nix toplevel    # includes tracking.json
++#   nix eval -f test-nixos-toplevel.nix filteredDotOutput --raw > deps.dot
++#   nix eval -f test-nixos-toplevel.nix configValues --json > config.json
++#   nix eval -f test-nixos-toplevel.nix counts
++let
++  nixpkgs = import ./nixpkgs { };
++  lib = nixpkgs.lib;
++
++  nixos = import ./nixpkgs/nixos/lib/eval-config.nix {
++    inherit lib;
++    trackDependencies = true;
++    modules = [
++      (
++        { modulesPath, ... }:
++        {
++          imports = [
++            (modulesPath + "/profiles/minimal.nix")
++          ];
++
++          services.vaultwarden.enable = true;
++          boot.loader.grub.device = "nodev";
++          fileSystems."/" = {
++            device = "/dev/sda1";
++            fsType = "ext4";
++          };
++          system.stateVersion = "24.05";
++        }
++      )
++    ];
++  };
++
++in
++{
++  # config.system.build.toplevel automatically includes tracking.json
++  # when trackDependencies = true. No manual builtins.seq needed.
++  toplevel = nixos.config.system.build.toplevel;
++
++  inherit (nixos.dependencyTracking)
++    rawDeps
++    filteredDeps
++    configValues
++    explicitConfigValues
++    leafNodes
++    explicitLeafNodes
++    keptNodes
++    rawDotOutput
++    filteredDotOutput
++    counts
++    ;
++}
+diff --git a/test-nixos-toplevel.nix b/test-nixos-toplevel.nix
+new file mode 100644
+index 000000000..7da182494
+--- /dev/null
++++ b/test-nixos-toplevel.nix
+@@ -0,0 +1,55 @@
++# Minimal NixOS evaluation with dependency tracking for system.build.toplevel
++#
++# This is a thin test harness that uses the integrated dependency tracking
++# from eval-config.nix. All processing logic lives in nixpkgs/nixos/lib/dependency-tracking.nix.
++#
++# Usage:
++#   nix build -f test-nixos-toplevel.nix toplevel    # includes tracking.json
++#   nix eval -f test-nixos-toplevel.nix filteredDotOutput --raw > deps.dot
++#   nix eval -f test-nixos-toplevel.nix configValues --json > config.json
++#   nix eval -f test-nixos-toplevel.nix counts
++let
++  nixpkgs = import ./nixpkgs { };
++  lib = nixpkgs.lib;
++
++  nixos = import ./nixpkgs/nixos/lib/eval-config.nix {
++    inherit lib;
++    trackDependencies = true;
++    modules = [
++      (
++        { modulesPath, ... }:
++        {
++          imports = [
++            (modulesPath + "/profiles/minimal.nix")
++          ];
++
++          boot.loader.grub.device = "nodev";
++          fileSystems."/" = {
++            device = "/dev/sda1";
++            fsType = "ext4";
++          };
++          system.stateVersion = "25.11";
++        }
++      )
++    ];
++  };
++
++in
++{
++  # config.system.build.toplevel automatically includes tracking.json
++  # when trackDependencies = true. No manual builtins.seq needed.
++  toplevel = nixos.config.system.build.toplevel;
++
++  inherit (nixos.dependencyTracking)
++    rawDeps
++    filteredDeps
++    configValues
++    explicitConfigValues
++    leafNodes
++    explicitLeafNodes
++    keptNodes
++    rawDotOutput
++    filteredDotOutput
++    counts
++    ;
++}
