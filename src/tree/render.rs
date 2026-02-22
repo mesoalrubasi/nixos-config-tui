@@ -401,7 +401,7 @@ pub(super) fn render_frame(
             frame.render_widget(Paragraph::new(detail_lines), detail_inner);
 
             // Dependencies pane
-            let deps_block = make_block_keyed("dependencies (uses these values)", Some(dep_count), 'd', s_deps_active);
+            let deps_block = make_block_keyed("dependencies (influenced by)", Some(dep_count), 'd', s_deps_active);
             let deps_inner = deps_block.inner(right_stack[1]);
             let deps_height = deps_inner.height as usize;
             let (deps_cursor_val, deps_scroll_val) = if s_deps_active {
@@ -773,7 +773,7 @@ pub(super) fn render_frame(
                     .split(bottom[1]);
 
                 // Dependencies
-                let deps_block = make_block_keyed("dependencies (uses these values)", Some(dep_count), 'd', deps_active);
+                let deps_block = make_block_keyed("dependencies (influenced by)", Some(dep_count), 'd', deps_active);
                 let deps_inner = deps_block.inner(right_stack[0]);
                 let deps_height = deps_inner.height as usize;
                 let deps_cursor_val = if deps_active {
@@ -842,7 +842,7 @@ pub(super) fn render_frame(
                 frame.render_widget(Paragraph::new(detail_lines), detail_inner);
 
                 // Dependencies
-                let deps_block = make_block_keyed("dependencies (uses these values)", Some(dep_count), 'd', deps_active);
+                let deps_block = make_block_keyed("dependencies (influenced by)", Some(dep_count), 'd', deps_active);
                 let deps_inner = deps_block.inner(bottom[1]);
                 let deps_height = deps_inner.height as usize;
                 let deps_cursor_val = if deps_active {
